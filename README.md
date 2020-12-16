@@ -1,5 +1,6 @@
 # Get-Latest-GitHub-Release
-Fetch latest GitHub Release and copy to local folder
+Fetch latest GitHub Release and copy to local folder  
+Caveat: I'm not a programmer so use at own risk :)
 
 DESCRIPTION  
 Script to fetch the latest release from specified GitHub Repo if it is newer than the local copy 
