@@ -82,10 +82,10 @@ $ProgressPreference = 'SilentlyContinue'
 $pathExtract = "$RootPath\$Name"
 
 # Test File paths and create if not exist
-If (!(test-path $PSScriptRoot\Versions)) {
+If (!(Test-Path $PSScriptRoot\Versions)) {
     New-Item -ItemType Directory -Force -Path $PSScriptRoot\Versions | Out-Null
 }
-If (!(test-path $pathExtract)) {
+If (!(Test-Path $pathExtract)) {
     New-Item -ItemType Directory -Force -Path $pathExtract | Out-Null
 }
 
