@@ -3,40 +3,36 @@ Fetch latest GitHub Release and copy to local folder
 Caveat: I'm not a programmer so use at own risk :)
 
 DESCRIPTION  
-Script to fetch the latest release from specified GitHub Repo if it is newer than the local copy 
-and extract the content to local folder while stopping and starting a service.
+This PowerShell script fetches the latest release from a specified GitHub repository, compares it with the local copy, and extracts the content to a local folder. Additionally, it can stop and start a service before and after the copy action.
 
-PARAMETER name  
-Name of the GitHub project (will be used to create directory in $RootPath)
+## Features
 
-PARAMETER repo  
-Github Repository to target.
+- **Automatic Update**: Automatically fetches the latest release from GitHub and updates the local copy if a newer version is available.
+- **Service Management**: Optionally stops and starts a service before and after the update process.
+- **Flexible Configuration**: Supports pre-release versions, customizable filename patterns, and inner directory extraction.
 
-PARAMETER filenamePattern  
-Filename pattern that will be looked for in the releases page, does except Powershell wildcards
+## Usage
 
-PARAMETER RootPath  
-The Root folder where the project need to be replicated to.
+```powershell
+.\Get-Latest-GitHub-Release.ps1 -Name 'YourProjectName' -repo 'yourusername/yourrepository' -filenamePattern 'YourFileNamePattern.zip' -RootPath 'C:\Your\Local\Path' -preRelease -RestartService 'YourServiceName'
+``` 
 
-PARAMETER innerDirectory  
-Needed it the project is zipped into a rootfolder.
+## Parameters
 
-PARAMETER preRelease  
-Needed if pre releases are to be downloaded.
+- **name**: Name of the GitHub project (used to create a directory in `$RootPath`).
+- **repo**: GitHub Repository to target.
+- **filenamePattern**: Filename pattern to look for in the releases page (supports PowerShell wildcards).
+- **RootPath**: The root folder where the project needs to be replicated.
+- **preRelease**: Needed if pre-releases are to be downloaded (optional).
+- **RestartService**: Specifies the service to stop and start before and after the copy action (optional).
 
-PARAMETER RestartService  
-If specified will stop Service and dependents as specified before copy action, will start all services afterwards.
+## Examples
+```powershell
+.\Get-Latest-GitHub-Release.ps1 -Name 'FileBrowser' -repo 'filebrowser/filebrowser' -filenamePattern 'windows-amd64-filebrowser.zip' -RootPath 'C:\Github' -RestartService 'FileBrowser'
 
-INPUTS  
-None
-  
-OUTPUTS  
-.\Versions\<name>.xml Created_at from GitHub Release to compare if there is a newer version
+.\Get-Latest-GitHub-Release.ps1 -Name 'Jackett' -repo 'Jackett/Jackett' -filenamePattern 'Jackett.Binaries.Windows.zip' -RootPath 'C:\Github' -preRelease -RestartService 'Jackett'
 
-EXAMPLE  
-```
-Get-Latest-GitHub-Release.ps1 -Name 'FileBrowser' -repo 'filebrowser/filebrowser' -filenamePattern 'windows-amd64-filebrowser.zip' -RootPath 'C:\Github' -innerDirectory $false -preRelease $false -RestartService 'FileBrowser'
-Get-Latest-GitHub-Release.ps1 -Name 'Jackett' -repo 'Jackett/Jackett' -filenamePattern 'Jackett.Binaries.Windows.zip' -RootPath 'C:\Github' -innerDirectory -preRelease -RestartService 'Jackett'
-Get-Latest-GitHub-Release.ps1 -Name 'MailSend-Go' -repo 'muquit/mailsend-go' -filenamePattern '*windows-64bit.zip' -RootPath 'C:\GitHub' -innerDirectory
-Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern 'SE[0-9][0-9][0-9][0-9].zip' -RootPath 'C:\GitHub'
+.\Get-Latest-GitHub-Release.ps1 -Name 'MailSend-Go' -repo 'muquit/mailsend-go' -filenamePattern '*windows-64bit.zip' -RootPath 'C:\GitHub'
+
+.\Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern 'SE[0-9][0-9][0-9].zip' -RootPath 'C:\GitHub'
 ```
