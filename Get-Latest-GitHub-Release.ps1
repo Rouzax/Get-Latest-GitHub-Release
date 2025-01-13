@@ -237,7 +237,8 @@ try {
     }
 
     # Write local created_at date to file for comparison on next run
-    $LatestOnline | ConvertTo-Json | Set-Content -Path $versionFile -Force
+    $LatestOnlineIso = $LatestOnline.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $LatestOnlineIso | ConvertTo-Json | Set-Content -Path $versionFile -Force
     Write-Log "Version information saved to: $versionFile"
 
     # Delete downloaded zip file
