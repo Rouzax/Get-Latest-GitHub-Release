@@ -150,7 +150,7 @@ try {
     if (Test-Path $versionFile) { 
         $CurrentInstall = Get-Content $versionFile -Raw | ConvertFrom-Json
         $PreviousVersionFound = $true 
-        [datetime]$localCreatedDate = $CurrentInstall.value
+        [datetime]$localCreatedDate = $CurrentInstall
         if ($localCreatedDate.Kind -ne "UTC") {
             $localCreatedDate = $localCreatedDate.ToUniversalTime()
         }
