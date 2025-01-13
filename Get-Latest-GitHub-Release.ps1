@@ -162,7 +162,11 @@ try {
     }
 
     # Install pre-release or latest stable
-    $releasesUri = "https://api.github.com/repos/$repo/releases/$($preRelease ? '' : 'latest')"
+    if ($preRelease) {
+        $releasesUri = "https://api.github.com/repos/$repo/releases/"
+    } else {
+        $releasesUri = "https://api.github.com/repos/$repo/releases/latest"
+    }
     Write-Log "Fetching from: $releasesUri"
     
     if ($preRelease) {
