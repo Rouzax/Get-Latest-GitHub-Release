@@ -1,3 +1,6 @@
 /Versions/
+/Backups/
+/Config/*
+!/Config/config.example.json
 CLAUDE.md
 .claude/

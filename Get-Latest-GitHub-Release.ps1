@@ -4,8 +4,14 @@
 .DESCRIPTION
   Script to fetch the latest release from specified GitHub Repo if it is newer than the local copy
   and extract the content to local folder while stopping and starting a service.
+
+  Features:
+  - Version comparison via GitHub releases API
+  - ZIP backup of current installation with automatic rollback on failure
+  - Optional Pushover notifications for success and failure
+  - Configuration file for shared settings across scheduled tasks
 .PARAMETER Name
-    Name of the GitHub project (will be used to create directory in $RootPath)
+    Name of the GitHub project (will be used to create directory in $RootPath).
 .PARAMETER repo
     Github Repository to target (format: owner/repository).
 .PARAMETER filenamePattern
@@ -19,16 +25,42 @@
     If specified will stop Service and dependents before copy action, will start all services afterwards.
 .PARAMETER UseRegex
     When specified, treats filenamePattern as a regular expression instead of a wildcard pattern.
+.PARAMETER PushoverUserKey
+    Pushover user/group key. Overrides value from config file. If neither provides credentials, notifications are skipped.
+.PARAMETER PushoverApiToken
+    Pushover application API token. Overrides value from config file.
+.PARAMETER PushoverDevice
+    Pushover device name to target. Overrides value from config file.
+.PARAMETER MaxBackups
+    Number of backup ZIPs to retain per project. Overrides value from config file. Default: 3.
 .INPUTS
   None
 .OUTPUTS
-  .\Versions\<name>.json Created_at from GitHub Release to compare if there is a newer version
+  .\Versions\<name>.json  - Created_at from GitHub Release for version comparison
+  .\Backups\<name>\*.zip  - ZIP backups of previous installations
 .NOTES
-  Version:        2.0
+  Version:        3.0
   Author:         Rouzax
   Creation Date:  2020-12-14
   Last Modified:  2026-05-27
-  Purpose/Change: Major robustness improvements for unattended execution
+  Purpose/Change: Added Pushover notifications, backup/rollback, config file support
+
+  CONFIGURATION FILE (optional):
+  Create Config\config.json next to the script:
+  {
+      "Pushover": {
+          "UserKey": "your-user-key",
+          "ApiToken": "your-api-token",
+          "Device": "optional-device-name",
+          "Notifications": {
+              "Success":  { "Priority": -1, "Sound": "none", "Ttl": 0 },
+              "Failed":   { "Priority":  1, "Sound": "none", "Ttl": 0 },
+              "Rollback": { "Priority":  1, "Sound": "none", "Ttl": 0 },
+              "Info":     { "Priority": -1, "Sound": "none", "Ttl": 0 }
+          }
+      },
+      "MaxBackups": 3
+  }
 
 .EXAMPLE
   # Basic usage with wildcard pattern
@@ -54,8 +86,19 @@ param(
     [Parameter(Mandatory = $false)]
     [switch] $preRelease,
     [Parameter(Mandatory = $false)]
-    [string] $RestartService
+    [string] $RestartService,
+    [Parameter(Mandatory = $false)]
+    [string] $PushoverUserKey,
+    [Parameter(Mandatory = $false)]
+    [string] $PushoverApiToken,
+    [Parameter(Mandatory = $false)]
+    [string] $PushoverDevice,
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 20)]
+    [int] $MaxBackups = 0
 )
+
+#region -- Functions ----------------------------------------------------------
 
 function Write-Log {
     param(
@@ -100,13 +143,204 @@ function Start-GitService {
     Write-Log "Started main service: $StartService"
 }
 
+function Get-ScriptConfig {
+    $configPath = Join-Path $PSScriptRoot (Join-Path 'Config' 'config.json')
+
+    # Defaults for notification types: priority, sound, ttl
+    $defaultNotifications = @{
+        'Success'  = @{ Priority = -1; Sound = 'none'; Ttl = 0 }
+        'Failed'   = @{ Priority = 1;  Sound = 'none'; Ttl = 0 }
+        'Rollback' = @{ Priority = 1;  Sound = 'none'; Ttl = 0 }
+        'Info'     = @{ Priority = -1; Sound = 'none'; Ttl = 0 }
+    }
+
+    $config = @{
+        PushoverUserKey  = $null
+        PushoverApiToken = $null
+        PushoverDevice   = $null
+        Notifications    = $defaultNotifications
+        MaxBackups       = 3
+    }
+
+    if (Test-Path $configPath) {
+        try {
+            $fileConfig = Get-Content $configPath -Raw | ConvertFrom-Json
+            if ($fileConfig.Pushover) {
+                if ($fileConfig.Pushover.UserKey)  { $config.PushoverUserKey  = $fileConfig.Pushover.UserKey }
+                if ($fileConfig.Pushover.ApiToken) { $config.PushoverApiToken = $fileConfig.Pushover.ApiToken }
+                if ($fileConfig.Pushover.Device)   { $config.PushoverDevice   = $fileConfig.Pushover.Device }
+                if ($fileConfig.Pushover.Notifications) {
+                    foreach ($type in @('Success', 'Failed', 'Rollback', 'Info')) {
+                        $notif = $fileConfig.Pushover.Notifications.$type
+                        if ($notif) {
+                            if ($null -ne $notif.Priority) { $config.Notifications[$type].Priority = [int]$notif.Priority }
+                            if ($notif.Sound)              { $config.Notifications[$type].Sound    = $notif.Sound }
+                            if ($null -ne $notif.Ttl)      { $config.Notifications[$type].Ttl      = [int]$notif.Ttl }
+                        }
+                    }
+                }
+            }
+            if ($null -ne $fileConfig.MaxBackups) {
+                $config.MaxBackups = [int]$fileConfig.MaxBackups
+            }
+            Write-Log "Loaded configuration from: $configPath"
+        } catch {
+            Write-Log "Failed to read config file, using defaults: $($_.Exception.Message)" -Level Warning
+        }
+    }
+
+    # Command-line parameters override config file
+    if ($PushoverUserKey)  { $config.PushoverUserKey  = $PushoverUserKey }
+    if ($PushoverApiToken) { $config.PushoverApiToken = $PushoverApiToken }
+    if ($PushoverDevice)   { $config.PushoverDevice   = $PushoverDevice }
+    if ($MaxBackups -gt 0) { $config.MaxBackups       = $MaxBackups }
+
+    return $config
+}
+
+function Send-PushoverNotification {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Success', 'Failed', 'Rollback', 'Info')]
+        [string]$Type,
+
+        [Parameter(Mandatory)]
+        [string]$Title,
+
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [string]$Url,
+        [string]$UrlTitle
+    )
+
+    if (-not $Script:Config.PushoverUserKey -or -not $Script:Config.PushoverApiToken) {
+        return
+    }
+
+    $notifConfig = $Script:Config.Notifications[$Type]
+
+    $body = @{
+        token    = $Script:Config.PushoverApiToken
+        user     = $Script:Config.PushoverUserKey
+        title    = $Title
+        message  = $Message
+        html     = 1
+        priority = $notifConfig.Priority
+        sound    = $notifConfig.Sound
+    }
+
+    if ($notifConfig.Ttl -gt 0) {
+        $body['ttl'] = $notifConfig.Ttl
+    }
+
+    if ($Script:Config.PushoverDevice) {
+        $body['device'] = $Script:Config.PushoverDevice
+    }
+
+    if ($Url) {
+        $body['url'] = $Url
+        if ($UrlTitle) {
+            $body['url_title'] = $UrlTitle
+        }
+    }
+
+    try {
+        $null = Invoke-RestMethod -Uri 'https://api.pushover.net/1/messages.json' `
+            -Method Post -Body $body -TimeoutSec 15 -ErrorAction Stop
+        Write-Log "Pushover notification sent: $Type"
+    } catch {
+        Write-Log "Pushover notification failed: $($_.Exception.Message)" -Level Warning
+    }
+}
+
+function New-InstallationBackup {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectName
+    )
+
+    # Nothing to back up if target is empty or missing
+    if (-not (Test-Path $SourcePath)) { return $null }
+    $contents = @(Get-ChildItem -Path $SourcePath)
+    if ($contents.Count -eq 0) { return $null }
+
+    $backupRoot = Join-Path $PSScriptRoot (Join-Path 'Backups' $ProjectName)
+    if (-not (Test-Path $backupRoot)) {
+        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $backupZip = Join-Path $backupRoot "$timestamp.zip"
+
+    Write-Log "Creating backup: $backupZip"
+    Compress-Archive -Path (Join-Path $SourcePath '*') -DestinationPath $backupZip -Force
+
+    $sizeMB = [math]::Round((Get-Item $backupZip).Length / 1MB, 1)
+    Write-Log "Backup created: ${sizeMB}MB"
+
+    # Prune old backups
+    $allBackups = @(Get-ChildItem -Path $backupRoot -Filter '*.zip' -File | Sort-Object Name -Descending)
+    if ($allBackups.Count -gt $Script:Config.MaxBackups) {
+        $allBackups | Select-Object -Skip $Script:Config.MaxBackups | ForEach-Object {
+            Write-Log "Pruning old backup: $($_.Name)"
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $backupZip
+}
+
+function Restore-FromBackup {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BackupZip,
+
+        [Parameter(Mandatory)]
+        [string]$TargetPath
+    )
+
+    if (-not (Test-Path $BackupZip)) {
+        Write-Log "Backup file not found: $BackupZip" -Level Error
+        return $false
+    }
+
+    Write-Log "Rolling back from backup: $BackupZip"
+
+    try {
+        # Clear the target directory
+        Get-ChildItem -Path $TargetPath -Force | Remove-Item -Recurse -Force
+
+        # Extract backup
+        Expand-Archive -Path $BackupZip -DestinationPath $TargetPath -Force
+        Write-Log "Rollback complete: files restored"
+        return $true
+    } catch {
+        Write-Log "Rollback failed: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+#endregion
+
+#region -- Main ---------------------------------------------------------------
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+$Script:Config = Get-ScriptConfig
 
 $serviceStopped = $false
 $pathZip = $null
 $tempExtract = $null
+$backupZip = $null
 $exitCode = 0
+$errorMessage = $null
+$downloadUri = $null
+$releaseUrl = $null
 
 try {
     # Validate service exists before doing any work
@@ -147,7 +381,7 @@ try {
             }
             $PreviousVersionFound = $true
             Write-Log "Local version Created Date: " -NoNewline
-            Write-Host $($localCreatedDate) -ForegroundColor DarkCyan
+            Write-Host $($localCreatedDate.ToString('yyyy-MM-ddTHH:mm:ssZ')) -ForegroundColor DarkCyan
         } catch {
             Write-Log "Version file is corrupt, treating as fresh install" -Level Warning
             Remove-Item $versionFile -Force -ErrorAction SilentlyContinue
@@ -191,10 +425,13 @@ try {
         if (-not $apiResponse -or @($apiResponse).Count -eq 0) {
             throw "No releases found for repository '$repo'."
         }
-        $Result = @($apiResponse)[0].assets
+        $releaseObj = @($apiResponse)[0]
     } else {
-        $Result = $apiResponse.assets
+        $releaseObj = $apiResponse
     }
+
+    $releaseUrl = $releaseObj.html_url
+    $Result = $releaseObj.assets
 
     if (-not $Result -or @($Result).Count -eq 0) {
         throw "Release found but it contains no downloadable assets."
@@ -230,7 +467,7 @@ try {
         $LatestOnline = $LatestOnline.ToUniversalTime()
     }
     Write-Log "Online version Created Date: " -NoNewline
-    Write-Host $($LatestOnline) -ForegroundColor DarkCyan
+    Write-Host $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ')) -ForegroundColor DarkCyan
 
     # Compare versions
     if ($PreviousVersionFound -and $LatestOnline -le $localCreatedDate) {
@@ -276,6 +513,9 @@ try {
         Remove-Item -Path $innerDirectory -Force -Recurse
     }
 
+    # Back up current installation before making changes
+    $backupZip = New-InstallationBackup -SourcePath $pathExtract -ProjectName $Name
+
     # Stop service only after download and extraction succeed, minimizing downtime
     if ($RestartService) {
         Write-Log "Stopping $RestartService and dependents"
@@ -286,12 +526,45 @@ try {
     # Deploy validated files to target
     Write-Log "Deploying to: $pathExtract"
     $sourceItems = Join-Path $tempExtract '*'
-    Copy-Item -Path $sourceItems -Destination $pathExtract -Recurse -Force
+    try {
+        Copy-Item -Path $sourceItems -Destination $pathExtract -Recurse -Force
+    } catch {
+        # Deployment failed: roll back if we have a backup
+        if ($backupZip) {
+            Write-Log "Deployment failed, rolling back: $($_.Exception.Message)" -Level Error
+            $null = Restore-FromBackup -BackupZip $backupZip -TargetPath $pathExtract
+        }
+        throw
+    }
 
     # Restart service immediately after files are in place
     if ($serviceStopped) {
-        Start-GitService -StartService $RestartService
-        $serviceStopped = $false
+        try {
+            Start-GitService -StartService $RestartService
+            $serviceStopped = $false
+        } catch {
+            # Service failed to start with new version: roll back
+            if ($backupZip) {
+                Write-Log "Service failed to start after update, rolling back" -Level Error
+                $null = Restore-FromBackup -BackupZip $backupZip -TargetPath $pathExtract
+                try {
+                    Start-GitService -StartService $RestartService
+                    $serviceStopped = $false
+                    Write-Log "Service started successfully after rollback"
+                } catch {
+                    Write-Log "Service also failed to start after rollback: $($_.Exception.Message)" -Level Error
+                }
+                Send-PushoverNotification -Type 'Rollback' `
+                    -Title "$Name update rolled back" `
+                    -Message (
+                        "<b>$Name</b> ($repo) failed to start after update." +
+                        "<br>Rolled back to previous version." +
+                        "<br><b>Asset:</b> $($selectedAsset.name)"
+                    ) `
+                    -Url $releaseUrl -UrlTitle 'Release Notes'
+            }
+            throw
+        }
     }
 
     # Write version file only after successful deployment
@@ -299,9 +572,19 @@ try {
     $LatestOnlineIso | ConvertTo-Json | Set-Content -Path $versionFile -Force
     Write-Log "Version information saved to: $versionFile"
 
-    Write-Log "Update completed successfully. New release date: $LatestOnline"
+    Write-Log "Update completed successfully. New release date: $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+
+    Send-PushoverNotification -Type 'Success' `
+        -Title "$Name updated" `
+        -Message (
+            "<b>$Name</b> ($repo) updated successfully." +
+            "<br><b>Release date:</b> $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))" +
+            "<br><b>Asset:</b> $($selectedAsset.name)"
+        ) `
+        -Url $releaseUrl -UrlTitle 'Release Notes'
 } catch {
-    Write-Log $_.Exception.Message -Level Error
+    $errorMessage = $_.Exception.Message
+    Write-Log $errorMessage -Level Error
     $exitCode = 1
 } finally {
     # Guarantee service restart even if the script fails after stopping it
@@ -314,6 +597,16 @@ try {
         }
     }
 
+    # Send failure notification (not for rollbacks, those are sent inline)
+    if ($exitCode -ne 0 -and $errorMessage) {
+        Send-PushoverNotification -Type 'Failed' `
+            -Title "$Name update failed" `
+            -Message (
+                "<b>$Name</b> ($repo) update failed." +
+                "<br><b>Error:</b> $errorMessage"
+            )
+    }
+
     # Clean up temp files
     if ($pathZip -and (Test-Path $pathZip)) {
         Remove-Item $pathZip -Force -ErrorAction SilentlyContinue
@@ -324,3 +617,5 @@ try {
 }
 
 exit $exitCode
+
+#endregion
