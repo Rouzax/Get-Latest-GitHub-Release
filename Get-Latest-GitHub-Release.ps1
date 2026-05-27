@@ -513,15 +513,15 @@ try {
         Remove-Item -Path $innerDirectory -Force -Recurse
     }
 
-    # Back up current installation before making changes
-    $backupZip = New-InstallationBackup -SourcePath $pathExtract -ProjectName $Name
-
-    # Stop service only after download and extraction succeed, minimizing downtime
+    # Stop service before backup so locked files (e.g. database files) can be read
     if ($RestartService) {
         Write-Log "Stopping $RestartService and dependents"
         Stop-Service -Name $RestartService -Force
         $serviceStopped = $true
     }
+
+    # Back up current installation after service is stopped
+    $backupZip = New-InstallationBackup -SourcePath $pathExtract -ProjectName $Name
 
     # Deploy validated files to target
     Write-Log "Deploying to: $pathExtract"

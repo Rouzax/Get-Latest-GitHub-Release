@@ -126,8 +126,8 @@ Pushover credentials and MaxBackups can be set once in `Config\config.json` inst
 5. Compares release dates. Exits if already up to date.
 6. Downloads the asset to a temp file. Verifies the file size matches GitHub's reported size.
 7. Extracts to a temp directory to validate the ZIP before touching the installation.
-8. Creates a ZIP backup of the current installation.
-9. Stops the service (if specified). Service downtime starts here.
+8. Stops the service (if specified). Service downtime starts here.
+9. Creates a ZIP backup of the current installation (after service stop so locked files can be read).
 10. Copies validated files to the target directory.
 11. Restarts the service. Service downtime ends here.
 12. Writes the version file.
