@@ -10,5 +10,6 @@
             "Info":     { "Priority": -1, "Sound": "none", "Ttl": 0 }
         }
     },
-    "MaxBackups": 3
+    "MaxBackups": 3,
+    "MaxLogs": 10
 }
