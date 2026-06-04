@@ -72,6 +72,11 @@
 
   # Using regex pattern for version-specific matching
   Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern '^SE\d+\.zip$' -RootPath 'C:\GitHub' -UseRegex
+
+  # Task Scheduler usage (pwsh.exe -File does not process single quotes;
+  # they become literal characters in parameter values, so omit them):
+  #   Program: pwsh.exe
+  #   Arguments: -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Github\Get-Latest-GitHub-Release\Get-Latest-GitHub-Release.ps1" -Name FileBrowser -repo filebrowser/filebrowser -filenamePattern windows-amd64-filebrowser.zip -RootPath C:\GitHub -RestartService FileBrowser
 #>
 
 [CmdletBinding()]
