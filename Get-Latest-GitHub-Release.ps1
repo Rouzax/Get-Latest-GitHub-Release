@@ -33,17 +33,20 @@
     Pushover device name to target. Overrides value from config file.
 .PARAMETER MaxBackups
     Number of backup ZIPs to retain per project. Overrides value from config file. Default: 3.
+.PARAMETER MaxLogs
+    Number of log files to retain per project. Overrides value from config file. Default: 10.
 .INPUTS
   None
 .OUTPUTS
   .\Versions\<name>.json  - Created_at from GitHub Release for version comparison
   .\Backups\<name>\*.zip  - ZIP backups of previous installations
+  .\Logs\<name>\*.log     - Per-run log files with timestamps
 .NOTES
-  Version:        3.0
+  Version:        3.1
   Author:         Rouzax
   Creation Date:  2020-12-14
-  Last Modified:  2026-05-27
-  Purpose/Change: Added Pushover notifications, backup/rollback, config file support
+  Last Modified:  2026-06-04
+  Purpose/Change: Added per-run file logging with rotation
 
   CONFIGURATION FILE (optional):
   Create Config\config.json next to the script:
@@ -59,7 +62,8 @@
               "Info":     { "Priority": -1, "Sound": "none", "Ttl": 0 }
           }
       },
-      "MaxBackups": 3
+      "MaxBackups": 3,
+      "MaxLogs": 10
   }
 
 .EXAMPLE
@@ -95,7 +99,10 @@ param(
     [string] $PushoverDevice,
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 20)]
-    [int] $MaxBackups = 0
+    [int] $MaxBackups = 0,
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 100)]
+    [int] $MaxLogs = 0
 )
 
 #region -- Functions ----------------------------------------------------------
@@ -104,27 +111,20 @@ function Write-Log {
     param(
         [string]$Message,
         [ValidateSet('Info', 'Warning', 'Error')]
-        [string]$Level = 'Info',
-        [switch]$NoNewline
+        [string]$Level = 'Info'
     )
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] ${Level}: $Message"
 
     switch ($Level) {
-        'Info' {
-            if ($NoNewline) {
-                Write-Host $logMessage -NoNewline
-            } else {
-                Write-Host $logMessage
-            }
-        }
-        'Warning' {
-            Write-Host $logMessage -ForegroundColor Yellow
-        }
-        'Error' {
-            Write-Host $logMessage -ForegroundColor Red
-        }
+        'Info'    { Write-Host $logMessage }
+        'Warning' { Write-Host $logMessage -ForegroundColor Yellow }
+        'Error'   { Write-Host $logMessage -ForegroundColor Red }
+    }
+
+    if ($Script:LogFile) {
+        Add-Content -Path $Script:LogFile -Value $logMessage -ErrorAction SilentlyContinue
     }
 }
 
@@ -160,6 +160,7 @@ function Get-ScriptConfig {
         PushoverDevice   = $null
         Notifications    = $defaultNotifications
         MaxBackups       = 3
+        MaxLogs          = 10
     }
 
     if (Test-Path $configPath) {
@@ -183,6 +184,9 @@ function Get-ScriptConfig {
             if ($null -ne $fileConfig.MaxBackups) {
                 $config.MaxBackups = [int]$fileConfig.MaxBackups
             }
+            if ($null -ne $fileConfig.MaxLogs) {
+                $config.MaxLogs = [int]$fileConfig.MaxLogs
+            }
             Write-Log "Loaded configuration from: $configPath"
         } catch {
             Write-Log "Failed to read config file, using defaults: $($_.Exception.Message)" -Level Warning
@@ -194,6 +198,7 @@ function Get-ScriptConfig {
     if ($PushoverApiToken) { $config.PushoverApiToken = $PushoverApiToken }
     if ($PushoverDevice)   { $config.PushoverDevice   = $PushoverDevice }
     if ($MaxBackups -gt 0) { $config.MaxBackups       = $MaxBackups }
+    if ($MaxLogs -gt 0)    { $config.MaxLogs          = $MaxLogs }
 
     return $config
 }
@@ -331,7 +336,37 @@ function Restore-FromBackup {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# Initialize log file
+try {
+    $logsRoot = Join-Path $PSScriptRoot (Join-Path 'Logs' $Name)
+    if (-not (Test-Path $logsRoot)) {
+        New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+    }
+    $Script:LogFile = Join-Path $logsRoot "$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+} catch {
+    Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Warning: Could not initialize log file: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+Write-Log "=== Get-Latest-GitHub-Release started ==="
+Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
+Write-Log "OS: $(if ($PSVersionTable.OS) { $PSVersionTable.OS } else { [System.Environment]::OSVersion.VersionString })"
+Write-Log "Script: $PSCommandPath"
+Write-Log "Parameters: Name=$Name, Repo=$repo, Pattern=$filenamePattern, UseRegex=$UseRegex, RootPath=$RootPath, PreRelease=$preRelease, RestartService=$RestartService"
+
 $Script:Config = Get-ScriptConfig
+
+Write-Log "Effective config: MaxBackups=$($Script:Config.MaxBackups), MaxLogs=$($Script:Config.MaxLogs), Pushover=$(if ($Script:Config.PushoverUserKey) { 'configured' } else { 'disabled' })"
+
+# Prune old log files
+if ($Script:LogFile) {
+    $allLogs = @(Get-ChildItem -Path $logsRoot -Filter '*.log' -File | Sort-Object Name -Descending)
+    if ($allLogs.Count -gt $Script:Config.MaxLogs) {
+        $allLogs | Select-Object -Skip $Script:Config.MaxLogs | ForEach-Object {
+            Write-Log "Pruning old log: $($_.Name)"
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 $serviceStopped = $false
 $pathZip = $null
@@ -380,8 +415,7 @@ try {
                 $localCreatedDate = $localCreatedDate.ToUniversalTime()
             }
             $PreviousVersionFound = $true
-            Write-Log "Local version Created Date: " -NoNewline
-            Write-Host $($localCreatedDate.ToString('yyyy-MM-ddTHH:mm:ssZ')) -ForegroundColor DarkCyan
+            Write-Log "Local version Created Date: $($localCreatedDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
         } catch {
             Write-Log "Version file is corrupt, treating as fresh install" -Level Warning
             Remove-Item $versionFile -Force -ErrorAction SilentlyContinue
@@ -466,8 +500,7 @@ try {
     if ($LatestOnline.Kind -ne "UTC") {
         $LatestOnline = $LatestOnline.ToUniversalTime()
     }
-    Write-Log "Online version Created Date: " -NoNewline
-    Write-Host $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ')) -ForegroundColor DarkCyan
+    Write-Log "Online version Created Date: $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
 
     # Compare versions
     if ($PreviousVersionFound -and $LatestOnline -le $localCreatedDate) {
@@ -585,6 +618,7 @@ try {
 } catch {
     $errorMessage = $_.Exception.Message
     Write-Log $errorMessage -Level Error
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
     $exitCode = 1
 } finally {
     # Guarantee service restart even if the script fails after stopping it
@@ -614,6 +648,8 @@ try {
     if ($tempExtract -and (Test-Path $tempExtract)) {
         Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    Write-Log "=== Script finished (exit code: $exitCode) ==="
 }
 
 exit $exitCode
