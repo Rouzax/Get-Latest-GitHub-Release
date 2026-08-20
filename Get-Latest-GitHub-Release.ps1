@@ -7,6 +7,7 @@
 
   Features:
   - Version comparison via GitHub releases API
+  - Handles both .zip release assets and unpacked binaries (e.g. a bare .exe)
   - ZIP backup of current installation with automatic rollback on failure
   - Optional Pushover notifications for success and failure
   - Configuration file for shared settings across scheduled tasks
@@ -17,6 +18,9 @@
 .PARAMETER filenamePattern
     Filename pattern that will be looked for in the releases page. By default uses PowerShell wildcards (-like operator).
     When -UseRegex is specified, uses regular expressions (-match operator).
+    Assets ending in .zip are extracted. Any other asset is deployed as a single file
+    under its released name, which covers projects that publish a bare executable.
+    Archive formats that cannot be extracted (.7z, .tar, .gz, ...) are rejected.
 .PARAMETER RootPath
     The Root folder where the project need to be replicated to.
 .PARAMETER preRelease
@@ -38,15 +42,19 @@
 .INPUTS
   None
 .OUTPUTS
-  .\Versions\<name>.json  - Created_at from GitHub Release for version comparison
+  .\Versions\<name>.json  - Release created_at, tag, asset name and install time, used for
+                            version comparison. Files written by versions before 3.3 hold a
+                            bare date string instead and are still read.
   .\Backups\<name>\*.zip  - ZIP backups of previous installations
   .\Logs\<name>\*.log     - Per-run log files with timestamps
 .NOTES
-  Version:        3.1
+  Version:        3.3
   Author:         Rouzax
   Creation Date:  2020-12-14
-  Last Modified:  2026-06-04
-  Purpose/Change: Added per-run file logging with rotation
+  Last Modified:  2026-08-20
+  Purpose/Change: Support unpacked binary assets, not just .zip; fix -preRelease (releases
+                  API URL, leaked [datetime] type constraint); report release tag and
+                  upgrade path in Pushover notifications
 
   CONFIGURATION FILE (optional):
   Create Config\config.json next to the script:
@@ -72,6 +80,9 @@
 
   # Using regex pattern for version-specific matching
   Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern '^SE\d+\.zip$' -RootPath 'C:\GitHub' -UseRegex
+
+  # Unpacked asset: this project publishes a bare filebrowser.exe rather than a zip
+  Get-Latest-GitHub-Release.ps1 -Name 'FileBrowserQuantum' -repo 'gtsteffaniak/filebrowser' -filenamePattern 'filebrowser.exe' -RootPath 'C:\GitHub' -RestartService 'FileBrowserQuantum'
 
   # Task Scheduler usage (pwsh.exe -File does not process single quotes;
   # they become literal characters in parameter values, so omit them):
@@ -381,6 +392,9 @@ $exitCode = 0
 $errorMessage = $null
 $downloadUri = $null
 $releaseUrl = $null
+$releaseTag = $null
+$isPreRelease = $false
+$localTag = $null
 
 try {
     # Validate service exists before doing any work
@@ -409,18 +423,31 @@ try {
         }
     }
 
-    # Read version file, recovering gracefully from corruption
+    # Read version file, recovering gracefully from corruption.
+    # Two shapes are accepted: a bare ISO date string, written by versions before
+    # 3.3, and the current object form. Reading the bare string keeps existing
+    # installs from looking like fresh ones after the script is upgraded.
     $PreviousVersionFound = $false
     $localCreatedDate = $null
     if (Test-Path $versionFile) {
         try {
             $CurrentInstall = Get-Content $versionFile -Raw | ConvertFrom-Json
-            [datetime]$localCreatedDate = $CurrentInstall
+            # Detect the shape by property, not by type: ConvertFrom-Json turns the
+            # bare ISO string of the old format straight into a [datetime], so a
+            # string test never matches it.
+            if ($CurrentInstall.PSObject.Properties.Name -contains 'CreatedAt') {
+                $localCreatedDate = [datetime]$CurrentInstall.CreatedAt
+                $localTag = $CurrentInstall.Tag
+            } else {
+                $localCreatedDate = [datetime]$CurrentInstall
+            }
             if ($localCreatedDate.Kind -ne "UTC") {
                 $localCreatedDate = $localCreatedDate.ToUniversalTime()
             }
             $PreviousVersionFound = $true
-            Write-Log "Local version Created Date: $($localCreatedDate.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            $localDesc = $localCreatedDate.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            if ($localTag) { $localDesc = "$localTag ($localDesc)" }
+            Write-Log "Local version: $localDesc"
         } catch {
             Write-Log "Version file is corrupt, treating as fresh install" -Level Warning
             Remove-Item $versionFile -Force -ErrorAction SilentlyContinue
@@ -431,7 +458,7 @@ try {
 
     # Build API URL
     if ($preRelease) {
-        $releasesUri = "https://api.github.com/repos/$repo/releases/"
+        $releasesUri = "https://api.github.com/repos/$repo/releases"
     } else {
         $releasesUri = "https://api.github.com/repos/$repo/releases/latest"
     }
@@ -470,6 +497,8 @@ try {
     }
 
     $releaseUrl = $releaseObj.html_url
+    $releaseTag = $releaseObj.tag_name
+    $isPreRelease = [bool]$releaseObj.prerelease
     $Result = $releaseObj.assets
 
     if (-not $Result -or @($Result).Count -eq 0) {
@@ -501,7 +530,7 @@ try {
     Write-Log "Matched asset: $($selectedAsset.name)"
 
     # Parse release date
-    [datetime]$LatestOnline = $selectedAsset.created_at
+    $LatestOnline = [datetime]$selectedAsset.created_at
     if ($LatestOnline.Kind -ne "UTC") {
         $LatestOnline = $LatestOnline.ToUniversalTime()
     }
@@ -536,19 +565,36 @@ try {
     }
     Write-Log "Download verified: $actualSize bytes"
 
-    # Extract to temp directory first so a corrupt zip never touches the target
+    # Stage into a temp directory first so a corrupt download never touches the target.
+    # Zip assets are extracted; projects that publish an unpacked binary (a bare .exe)
+    # are staged as a single file under the name GitHub released it as.
     $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) "$Name-extract-$(Get-Random)"
     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-    Write-Log "Extracting to temporary directory for validation"
-    Expand-Archive -Path $pathZip -DestinationPath $tempExtract -Force
 
-    # Flatten single wrapper directory (immediate children only, not -Recurse)
-    $extractedItems = @(Get-ChildItem -Path $tempExtract)
-    if ($extractedItems.Count -eq 1 -and $extractedItems[0].PSIsContainer) {
-        $innerDirectory = $extractedItems[0].FullName
-        Write-Log "Flattening wrapper directory: $($extractedItems[0].Name)"
-        Get-ChildItem -Path $innerDirectory | Move-Item -Destination $tempExtract -Force
-        Remove-Item -Path $innerDirectory -Force -Recurse
+    $assetExtension = [System.IO.Path]::GetExtension($selectedAsset.name)
+
+    if ($assetExtension -eq '.zip') {
+        Write-Log "Extracting to temporary directory for validation"
+        Expand-Archive -Path $pathZip -DestinationPath $tempExtract -Force
+
+        # Flatten single wrapper directory (immediate children only, not -Recurse)
+        $extractedItems = @(Get-ChildItem -Path $tempExtract)
+        if ($extractedItems.Count -eq 1 -and $extractedItems[0].PSIsContainer) {
+            $innerDirectory = $extractedItems[0].FullName
+            Write-Log "Flattening wrapper directory: $($extractedItems[0].Name)"
+            Get-ChildItem -Path $innerDirectory | Move-Item -Destination $tempExtract -Force
+            Remove-Item -Path $innerDirectory -Force -Recurse
+        }
+    } else {
+        # Refuse archive formats we cannot open rather than deploying them verbatim,
+        # which would leave an unusable .tar.gz sitting where the binary should be.
+        $unsupportedArchives = @('.7z', '.gz', '.tgz', '.bz2', '.xz', '.rar', '.tar')
+        if ($unsupportedArchives -contains $assetExtension) {
+            throw "Asset '$($selectedAsset.name)' is an archive format this script cannot extract. Only .zip archives and unpacked files are supported."
+        }
+
+        Write-Log "Asset is not an archive, staging as a single file: $($selectedAsset.name)"
+        Copy-Item -Path $pathZip -Destination (Join-Path $tempExtract $selectedAsset.name) -Force
     }
 
     # Stop service before backup so locked files (e.g. database files) can be read
@@ -593,11 +639,14 @@ try {
                     Write-Log "Service also failed to start after rollback: $($_.Exception.Message)" -Level Error
                 }
                 Send-PushoverNotification -Type 'Rollback' `
-                    -Title "$Name update rolled back" `
+                    -Title "$Name rolled back" `
                     -Message (
                         "<b>$Name</b> ($repo) failed to start after update." +
-                        "<br>Rolled back to previous version." +
-                        "<br><b>Asset:</b> $($selectedAsset.name)"
+                        "<br><b>Attempted:</b> $(if ($releaseTag) { $releaseTag } else { 'new release' })" +
+                        "<br><b>Restored:</b> $(if ($localTag) { $localTag } else { 'previous version' })" +
+                        "<br><b>Service:</b> $RestartService" +
+                        "<br><b>Asset:</b> $($selectedAsset.name)" +
+                        "<br><b>Backup:</b> $backupZip"
                     ) `
                     -Url $releaseUrl -UrlTitle 'Release Notes'
             }
@@ -605,19 +654,43 @@ try {
         }
     }
 
-    # Write version file only after successful deployment
+    # Write version file only after successful deployment. Tag is stored so the
+    # next run can report the upgrade as "old tag -> new tag" rather than dates.
     $LatestOnlineIso = $LatestOnline.ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $LatestOnlineIso | ConvertTo-Json | Set-Content -Path $versionFile -Force
+    [PSCustomObject]@{
+        CreatedAt = $LatestOnlineIso
+        Tag       = $releaseTag
+        Asset     = $selectedAsset.name
+        Installed = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    } | ConvertTo-Json | Set-Content -Path $versionFile -Force
     Write-Log "Version information saved to: $versionFile"
 
     Write-Log "Update completed successfully. New release date: $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
 
+    # Notification detail: lead with the tag, which is what a reader recognises,
+    # and fall back to release dates for repos that publish untagged releases.
+    $notifyTitle = if ($releaseTag) { "$Name updated to $releaseTag" } else { "$Name updated" }
+    $versionLine = if ($releaseTag -and $localTag) {
+        "<br><b>Version:</b> $localTag -&gt; $releaseTag"
+    } elseif ($releaseTag) {
+        "<br><b>Version:</b> $releaseTag"
+    } else {
+        ""
+    }
+    $channelLine = if ($isPreRelease) { "<br><b>Channel:</b> Pre-release" } else { "<br><b>Channel:</b> Stable" }
+    $serviceLine = if ($RestartService) { "<br><b>Service:</b> $RestartService restarted" } else { "" }
+    $assetSizeMB = [math]::Round($selectedAsset.size / 1MB, 1)
+
     Send-PushoverNotification -Type 'Success' `
-        -Title "$Name updated" `
+        -Title $notifyTitle `
         -Message (
-            "<b>$Name</b> ($repo) updated successfully." +
-            "<br><b>Release date:</b> $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))" +
-            "<br><b>Asset:</b> $($selectedAsset.name)"
+            "<b>$Name</b> ($repo)" +
+            $versionLine +
+            $channelLine +
+            "<br><b>Released:</b> $($LatestOnline.ToString('yyyy-MM-dd HH:mm')) UTC" +
+            "<br><b>Asset:</b> $($selectedAsset.name) (${assetSizeMB}MB)" +
+            "<br><b>Path:</b> $pathExtract" +
+            $serviceLine
         ) `
         -Url $releaseUrl -UrlTitle 'Release Notes'
 } catch {
@@ -638,12 +711,18 @@ try {
 
     # Send failure notification (not for rollbacks, those are sent inline)
     if ($exitCode -ne 0 -and $errorMessage) {
+        $failTargetLine = if ($releaseTag) { "<br><b>Target:</b> $releaseTag" } else { "" }
+        $failLogLine = if ($Script:LogFile) { "<br><b>Log:</b> $($Script:LogFile)" } else { "" }
+
         Send-PushoverNotification -Type 'Failed' `
             -Title "$Name update failed" `
             -Message (
                 "<b>$Name</b> ($repo) update failed." +
-                "<br><b>Error:</b> $errorMessage"
-            )
+                $failTargetLine +
+                "<br><b>Error:</b> $errorMessage" +
+                $failLogLine
+            ) `
+            -Url $releaseUrl -UrlTitle 'Release Notes'
     }
 
     # Clean up temp files
