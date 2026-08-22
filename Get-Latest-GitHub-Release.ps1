@@ -7,6 +7,7 @@
 
   Features:
   - Version comparison via GitHub releases API
+  - Optional release channel pinning by tag pattern
   - Handles both .zip release assets and unpacked binaries (e.g. a bare .exe)
   - ZIP backup of current installation with automatic rollback on failure
   - Optional Pushover notifications for success and failure
@@ -24,11 +25,29 @@
 .PARAMETER RootPath
     The Root folder where the project need to be replicated to.
 .PARAMETER preRelease
-    Needed if pre releases are to be downloaded.
+    Needed if pre releases are to be downloaded. Without it only stable releases are
+    considered, whether or not ReleaseTagPattern is used.
+.PARAMETER ReleaseTagPattern
+    Optional pattern matched against the release tag (tag_name), used to pin a task to one
+    release channel in repositories that publish several in parallel. Wildcards by default
+    (-like); regular expressions when -UseRegex is given, the same as filenamePattern.
+    The newest matching release is selected, and filenamePattern then picks the asset inside
+    it. Without -preRelease only stable releases are eligible, so a wildcard such as 'v5.*'
+    will not select 'v5.2.0-beta21'. Add -preRelease to make prereleases eligible, which is
+    how you follow a beta line: -preRelease -ReleaseTagPattern 'v5.2.0-beta*'.
+    The 100 most recent releases are searched. When nothing matches, every candidate tag is
+    written to the log, which shows the repository's actual tag format (tag prefixes are
+    often inconsistent: SubtitleEdit tags 'v5.1.0' but '4.0.16', so 'v4.*' matches nothing).
+    Repointing this at another channel installs the newly selected release even when it is
+    older than the installed one, so switching channel is not mistaken for "up to date". The
+    test is whether the installed release is still among the releases the current filters
+    select, which also catches a stable pin whose installed release was a prerelease.
 .PARAMETER RestartService
     If specified will stop Service and dependents before copy action, will start all services afterwards.
 .PARAMETER UseRegex
-    When specified, treats filenamePattern as a regular expression instead of a wildcard pattern.
+    When specified, treats filenamePattern, and ReleaseTagPattern when given, as regular
+    expressions instead of wildcard patterns. It applies to both; there is no way to use a
+    wildcard for one and a regex for the other.
 .PARAMETER PushoverUserKey
     Pushover user/group key. Overrides value from config file. If neither provides credentials, notifications are skipped.
 .PARAMETER PushoverApiToken
@@ -48,13 +67,14 @@
   .\Backups\<name>\*.zip  - ZIP backups of previous installations
   .\Logs\<name>\*.log     - Per-run log files with timestamps
 .NOTES
-  Version:        3.3
+  Version:        3.4
   Author:         Rouzax
   Creation Date:  2020-12-14
-  Last Modified:  2026-08-20
-  Purpose/Change: Support unpacked binary assets, not just .zip; fix -preRelease (releases
-                  API URL, leaked [datetime] type constraint); report release tag and
-                  upgrade path in Pushover notifications
+  Last Modified:  2026-08-22
+  Purpose/Change: Add -ReleaseTagPattern to pin a task to one release channel; install a
+                  newly selected channel even when its release is older than the installed
+                  one; search the 100 most recent releases rather than GitHub's default 30;
+                  refresh the SubtitleEdit examples for the v5 asset naming
 
   CONFIGURATION FILE (optional):
   Create Config\config.json next to the script:
@@ -78,8 +98,19 @@
   # Basic usage with wildcard pattern
   Get-Latest-GitHub-Release.ps1 -Name 'FileBrowser' -repo 'filebrowser/filebrowser' -filenamePattern 'windows-amd64-filebrowser.zip' -RootPath 'C:\Github' -RestartService 'FileBrowser'
 
-  # Using regex pattern for version-specific matching
-  Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern '^SE\d+\.zip$' -RootPath 'C:\GitHub' -UseRegex
+  # Two tasks from one repository. SubtitleEdit ships the GUI and the SeConv CLI as separate
+  # assets of the same release, so they differ only by -Name and -filenamePattern. Give each
+  # a distinct -Name: both archives contain LICENSE and libse.xml and would otherwise collide.
+  # Use exact asset names; 'SubtitleEdit-Windows-x64*' also matches the -Setup.exe installer.
+  Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEdit' -repo 'SubtitleEdit/subtitleedit' -filenamePattern 'SubtitleEdit-Windows-x64.zip' -RootPath 'C:\GitHub'
+  Get-Latest-GitHub-Release.ps1 -Name 'SeConv' -repo 'SubtitleEdit/subtitleedit' -filenamePattern 'SeConv-Windows-x64.zip' -RootPath 'C:\GitHub'
+
+  # Pin to a release channel. SubtitleEdit publishes a beta most days, so this follows the
+  # v5.2.0 beta line and will not jump tracks once a v5.3.0 beta line opens.
+  Get-Latest-GitHub-Release.ps1 -Name 'SubtitleEditBeta' -repo 'SubtitleEdit/subtitleedit' -filenamePattern 'SubtitleEdit-Windows-x64.zip' -RootPath 'C:\GitHub' -preRelease -ReleaseTagPattern 'v5.2.0-beta*'
+
+  # Same idea with regex; -UseRegex applies to the tag pattern and the filename pattern alike
+  Get-Latest-GitHub-Release.ps1 -Name 'FileBrowserQuantum' -repo 'gtsteffaniak/filebrowser' -filenamePattern 'filebrowser\.exe' -RootPath 'C:\GitHub' -preRelease -ReleaseTagPattern '^v2\..*-beta$' -UseRegex
 
   # Unpacked asset: this project publishes a bare filebrowser.exe rather than a zip
   Get-Latest-GitHub-Release.ps1 -Name 'FileBrowserQuantum' -repo 'gtsteffaniak/filebrowser' -filenamePattern 'filebrowser.exe' -RootPath 'C:\GitHub' -RestartService 'FileBrowserQuantum'
@@ -106,6 +137,8 @@ param(
     [Parameter(Mandatory = $false)]
     [switch] $preRelease,
     [Parameter(Mandatory = $false)]
+    [string] $ReleaseTagPattern,
+    [Parameter(Mandatory = $false)]
     [string] $RestartService,
     [Parameter(Mandatory = $false)]
     [string] $PushoverUserKey,
@@ -122,6 +155,23 @@ param(
 )
 
 #region -- Functions ----------------------------------------------------------
+
+function Test-PatternMatch {
+    <#
+        Single matcher shared by the asset filter and the release tag filter so the
+        two can never drift apart. $Regex is passed in rather than read from the
+        parent scope, which keeps the function testable on its own.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Value,
+        [Parameter(Mandatory = $true)]
+        [string] $Pattern,
+        [switch] $Regex
+    )
+    if ($Regex) { $Value -match $Pattern } else { $Value -like $Pattern }
+}
 
 function Write-Log {
     param(
@@ -367,7 +417,7 @@ Write-Log "=== Get-Latest-GitHub-Release started ==="
 Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
 Write-Log "OS: $(if ($PSVersionTable.OS) { $PSVersionTable.OS } else { [System.Environment]::OSVersion.VersionString })"
 Write-Log "Script: $PSCommandPath"
-Write-Log "Parameters: Name=$Name, Repo=$repo, Pattern=$filenamePattern, UseRegex=$UseRegex, RootPath=$RootPath, PreRelease=$preRelease, RestartService=$RestartService"
+Write-Log "Parameters: Name=$Name, Repo=$repo, Pattern=$filenamePattern, UseRegex=$UseRegex, RootPath=$RootPath, PreRelease=$preRelease, ReleaseTagPattern=$ReleaseTagPattern, RestartService=$RestartService"
 
 $Script:Config = Get-ScriptConfig
 
@@ -395,6 +445,7 @@ $releaseUrl = $null
 $releaseTag = $null
 $isPreRelease = $false
 $localTag = $null
+$channelTags = $null
 
 try {
     # Validate service exists before doing any work
@@ -403,12 +454,19 @@ try {
         Write-Log "Validated service: $RestartService (Status: $($svc.Status))"
     }
 
-    # Validate regex pattern compiles
+    # Validate regex patterns compile before any network or service work happens
     if ($UseRegex) {
         try {
             [regex]::new($filenamePattern) | Out-Null
         } catch {
             throw "Invalid regex pattern '$filenamePattern': $($_.Exception.Message)"
+        }
+        if ($ReleaseTagPattern) {
+            try {
+                [regex]::new($ReleaseTagPattern) | Out-Null
+            } catch {
+                throw "Invalid regex release tag pattern '$ReleaseTagPattern': $($_.Exception.Message)"
+            }
         }
     }
 
@@ -456,9 +514,12 @@ try {
         Write-Log "No previous version found"
     }
 
-    # Build API URL
-    if ($preRelease) {
-        $releasesUri = "https://api.github.com/repos/$repo/releases"
+    # Build API URL. A tag pattern has to filter the full list, so it uses the same
+    # endpoint as -preRelease. per_page=100 widens GitHub's default page of 30 in the
+    # same single request, which matters for repos that publish prereleases daily and
+    # push their stable releases far down the list.
+    if ($preRelease -or $ReleaseTagPattern) {
+        $releasesUri = "https://api.github.com/repos/$repo/releases?per_page=100"
     } else {
         $releasesUri = "https://api.github.com/repos/$repo/releases/latest"
     }
@@ -487,11 +548,39 @@ try {
         }
     }
 
-    if ($preRelease) {
+    if ($preRelease -or $ReleaseTagPattern) {
         if (-not $apiResponse -or @($apiResponse).Count -eq 0) {
             throw "No releases found for repository '$repo'."
         }
-        $releaseObj = @($apiResponse)[0]
+        $releases = @($apiResponse)
+
+        if ($ReleaseTagPattern) {
+            # /releases carries prereleases, where /releases/latest never does. Without
+            # -preRelease a tag pattern still has to mean "stable only", because a
+            # wildcard such as 'v5.*' matches 'v5.2.0-beta21' just as readily as 'v5.1.0'.
+            if (-not $preRelease) {
+                $releases = @($releases.Where({ -not $_.prerelease }))
+            }
+
+            $matchingReleases = @($releases.Where({
+                        Test-PatternMatch -Value $_.tag_name -Pattern $ReleaseTagPattern -Regex:$UseRegex
+                    }))
+
+            if ($matchingReleases.Count -eq 0) {
+                Write-Log "Available tags (searched $($releases.Count) most recent releases):" -Level Warning
+                $releases | ForEach-Object { Write-Log "  - $($_.tag_name)" -Level Warning }
+                throw "No release found matching tag pattern: '$ReleaseTagPattern'"
+            }
+
+            # GitHub returns releases newest first and the -preRelease path already
+            # relies on that, so the filtered list keeps the same order rather than
+            # re-sorting on created_at, which is the tag's commit date, not publish time.
+            $releaseObj = $matchingReleases[0]
+            $channelTags = @($matchingReleases | ForEach-Object { $_.tag_name })
+            Write-Log "Matched release tag: $($releaseObj.tag_name) ($($matchingReleases.Count) of $($releases.Count) releases matched '$ReleaseTagPattern')"
+        } else {
+            $releaseObj = $releases[0]
+        }
     } else {
         $releaseObj = $apiResponse
     }
@@ -506,13 +595,9 @@ try {
     }
 
     # Match assets by pattern
-    $matchingAssets = @(
-        if ($UseRegex) {
-            $Result.Where({ $_.name -match $filenamePattern })
-        } else {
-            $Result.Where({ $_.name -like $filenamePattern })
-        }
-    )
+    $matchingAssets = @($Result.Where({
+                Test-PatternMatch -Value $_.name -Pattern $filenamePattern -Regex:$UseRegex
+            }))
 
     if ($matchingAssets.Count -eq 0) {
         Write-Log "Available assets:" -Level Warning
@@ -529,20 +614,39 @@ try {
     $selectedAsset = $matchingAssets[0]
     Write-Log "Matched asset: $($selectedAsset.name)"
 
-    # Parse release date
+    # Parse the date from the asset, not the release. One release can carry asset
+    # groups uploaded minutes apart (SubtitleEdit stamps its GUI and SeConv assets
+    # separately), so two tasks tracking the same repo each follow their own asset.
     $LatestOnline = [datetime]$selectedAsset.created_at
     if ($LatestOnline.Kind -ne "UTC") {
         $LatestOnline = $LatestOnline.ToUniversalTime()
     }
     Write-Log "Online version Created Date: $($LatestOnline.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
 
+    # Repointing -ReleaseTagPattern at another channel can select a release that is
+    # older than what is installed, which the date comparison alone would report as
+    # up to date, silently never switching. Detect that and install regardless of date.
+    #
+    # The test is membership of the candidate list, not a match against the pattern.
+    # The pattern alone cannot see the prerelease filter: 'v5.2.0-beta21' matches the
+    # wildcard 'v5.*' perfectly well, and what excludes it from a stable pin is its
+    # prerelease flag. Anything the filters actually rejected is a channel change.
+    # Version files written before 3.3 carry no tag and keep the old behaviour.
+    $channelSwitch = $false
+    if ($ReleaseTagPattern -and $localTag -and $channelTags -notcontains $localTag) {
+        $channelSwitch = $true
+        Write-Log "Channel switch: installed $localTag is no longer in the channel selected by '$ReleaseTagPattern'" -Level Warning
+    }
+
     # Compare versions
-    if ($PreviousVersionFound -and $LatestOnline -le $localCreatedDate) {
+    if ($PreviousVersionFound -and -not $channelSwitch -and $LatestOnline -le $localCreatedDate) {
         Write-Log "Local version is up to date"
         exit 0
     }
 
-    if ($PreviousVersionFound) {
+    if ($channelSwitch) {
+        Write-Log "Switching channel to $releaseTag, installing regardless of release date"
+    } elseif ($PreviousVersionFound) {
         Write-Log "Current install is older than on GitHub, updating"
     } else {
         Write-Log "No previous version found, installing"
