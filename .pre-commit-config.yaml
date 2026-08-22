@@ -1,0 +1,21 @@
+# Local hooks only. Shelling out to pwsh keeps third-party hook repositories, and the
+# code they would run on every commit, out of the commit path entirely.
+#
+# Setup, once per clone:
+#   pip install pre-commit
+#   pre-commit install
+#
+# The gate is described in PSScriptAnalyzerSettings.psd1: Error severity blocks the
+# commit, Warnings are printed but do not. Run tools\Invoke-Lint.ps1 by hand to check
+# the whole repository rather than just the staged files.
+
+repos:
+  - repo: local
+    hooks:
+      - id: psscriptanalyzer
+        name: PSScriptAnalyzer
+        description: Lint changed PowerShell files, failing on Error severity.
+        entry: pwsh -NoProfile -NonInteractive -File tools/Invoke-Lint.ps1 -Path
+        language: system
+        files: \.ps1$
+        pass_filenames: true
