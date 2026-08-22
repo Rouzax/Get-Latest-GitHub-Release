@@ -172,6 +172,21 @@ against the pattern: `v5.2.0-beta21` matches the wildcard `v5.*` just fine; what
 from a stable pin is its prerelease flag. Once switched, later runs compare dates normally,
 so the task settles on its new channel instead of reinstalling every run.
 
+**Adding the pattern to a task that predates version 3.3** works the same way, for a different
+reason. Those version files record only a date, with no tag to test, so the first run under a
+pattern is treated as a switch and installs whatever the pattern selects:
+
+```
+Channel switch: version file predates tag tracking, installing v2.0.1-beta to adopt 'v2.*'
+```
+
+Falling back to the date comparison here is not merely uninformative, it can be wrong. Dates
+are compared on asset upload time, and a project that builds parallel channels in one CI run
+uploads them seconds apart in no particular order: `gtsteffaniak/filebrowser` published the
+`v2.0.1-beta` binary six seconds *before* the `v1.5.2-stable` one. A task moving from v1.5 to
+v2 therefore read its old install as newer and reported "up to date" indefinitely. The switch
+fires once; afterwards the version file carries a tag and normal comparison resumes.
+
 **Tag formats are often inconsistent.** SubtitleEdit tags its 5.x releases `v5.1.0` but its
 4.x releases `4.0.16`, so `v4.*` matches nothing while `4.*` does. Check the repository's
 releases page, or run once and read the candidate tags in the log.

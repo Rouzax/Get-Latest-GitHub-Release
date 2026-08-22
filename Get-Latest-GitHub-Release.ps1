@@ -42,6 +42,9 @@
     older than the installed one, so switching channel is not mistaken for "up to date". The
     test is whether the installed release is still among the releases the current filters
     select, which also catches a stable pin whose installed release was a prerelease.
+    Adding the parameter to a task whose version file predates 3.3, and so records no tag,
+    counts as a switch too: there is no tag to test, and the dates alone cannot show the
+    change of channel. That first run installs the selected release whatever its date.
 .PARAMETER RestartService
     If specified will stop Service and dependents before copy action, will start all services afterwards.
 .PARAMETER UseRegex
@@ -67,11 +70,17 @@
   .\Backups\<name>\*.zip  - ZIP backups of previous installations
   .\Logs\<name>\*.log     - Per-run log files with timestamps
 .NOTES
-  Version:        3.4
+  Version:        3.4.1
   Author:         Rouzax
   Creation Date:  2020-12-14
   Last Modified:  2026-08-22
-  Purpose/Change: Add -ReleaseTagPattern to pin a task to one release channel; install a
+  Purpose/Change: Treat the first run of -ReleaseTagPattern against a pre-3.3 version file,
+                  which records no tag, as a channel switch. Adding the parameter to an
+                  existing task otherwise fell back to the date comparison, which cannot see
+                  a change of channel and can contradict it outright, so the feature silently
+                  did nothing on exactly the tasks it exists for.
+
+                  3.4: Add -ReleaseTagPattern to pin a task to one release channel; install a
                   newly selected channel even when its release is older than the installed
                   one; search the 100 most recent releases rather than GitHub's default 30;
                   refresh the SubtitleEdit examples for the v5 asset naming
@@ -631,11 +640,25 @@ try {
     # The pattern alone cannot see the prerelease filter: 'v5.2.0-beta21' matches the
     # wildcard 'v5.*' perfectly well, and what excludes it from a stable pin is its
     # prerelease flag. Anything the filters actually rejected is a channel change.
-    # Version files written before 3.3 carry no tag and keep the old behaviour.
     $channelSwitch = $false
-    if ($ReleaseTagPattern -and $localTag -and $channelTags -notcontains $localTag) {
-        $channelSwitch = $true
-        Write-Log "Channel switch: installed $localTag is no longer in the channel selected by '$ReleaseTagPattern'" -Level Warning
+    if ($ReleaseTagPattern -and $PreviousVersionFound) {
+        if (-not $localTag) {
+            # Version files written before 3.3 record a date and no tag, so there is
+            # nothing to test membership against. Treat the first run under a pattern
+            # as a switch rather than falling back to dates: the pattern is added to
+            # an existing task precisely to move it to another channel, and the dates
+            # cannot show that. Worse, they can actively contradict it, because the
+            # comparison is on asset upload time and parallel channels are built by
+            # one CI run: gtsteffaniak/filebrowser uploaded the v2.0.1-beta binary six
+            # seconds before the v1.5.2-stable one, so a task adopting 'v2.*' read its
+            # v1.5 install as newer and reported "up to date" forever. Fires once,
+            # since the file written after deployment carries a tag.
+            $channelSwitch = $true
+            Write-Log "Channel switch: version file predates tag tracking, installing $releaseTag to adopt '$ReleaseTagPattern'" -Level Warning
+        } elseif ($channelTags -notcontains $localTag) {
+            $channelSwitch = $true
+            Write-Log "Channel switch: installed $localTag is no longer in the channel selected by '$ReleaseTagPattern'" -Level Warning
+        }
     }
 
     # Compare versions
